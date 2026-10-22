@@ -1,6 +1,7 @@
 <script lang="ts" setup>
-import { computed, onBeforeUnmount, ref, shallowRef } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, shallowRef } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import { ElMessageBox } from 'element-plus'
 import {
   ArrowLeft,
   ArrowRight,
@@ -16,6 +17,10 @@ import {
   confirmEmailLogin,
   confirmEmailRegistration,
   connectWallet,
+  cancelEmailRegistration,
+  hasPendingEmailRegistration,
+  resendEmailRegistration,
+  resumeEmailRegistration,
   requestEmailLogin,
   requestEmailRegistration,
 } from '@/plugins/auth'
@@ -25,6 +30,7 @@ import { notifySuccess } from '@/utils/message'
 type AuthMethod = 'email' | 'wallet'
 type EmailMode = 'login' | 'register'
 type EmailStep = 'form' | 'code'
+type PasskeyPreference = 'auto' | 'client-device' | 'hybrid' | 'security-key'
 
 const router = useRouter()
 const route = useRoute()
@@ -41,12 +47,17 @@ const avatar = ref(avatarForSeed('yeying'))
 const avatarTouched = ref(false)
 const password = ref('')
 const confirmPassword = ref('')
+const passkeyPreference = ref<PasskeyPreference>('auto')
 // The registration request contains ethers Wallet and CryptoKey instances.
 // Keep the object unproxied so native private fields retain their receiver.
 const emailRequest = shallowRef<Awaited<ReturnType<typeof requestEmailRegistration>> | null>(null)
 const emailLoginRequest = shallowRef<Awaited<ReturnType<typeof requestEmailLogin>> | null>(null)
 const errorMessage = ref('')
 const infoMessage = ref('')
+const hasSavedRegistration = ref(false)
+const showRegistrationRecovery = ref(false)
+const recoveryPassword = ref('')
+const recoveryBusy = ref(false)
 const resendIn = ref(0)
 let resendTimer: number | null = null
 
@@ -90,11 +101,17 @@ function isEmailNotFound(error: unknown) {
   return errorText(error).toUpperCase().includes('IDENTITY_EMAIL_ACCOUNT_NOT_FOUND')
 }
 
-function startResendTimer() {
+function startResendTimer(expiresAt?: string) {
   if (resendTimer !== null) {
     window.clearInterval(resendTimer)
   }
-  resendIn.value = 60
+  const challengeExpiresAt = Date.parse(expiresAt || '')
+  const inferredSentAt = Number.isFinite(challengeExpiresAt) ? challengeExpiresAt - 10 * 60 * 1000 : Date.now()
+  resendIn.value = Math.max(0, Math.ceil((inferredSentAt + 60 * 1000 - Date.now()) / 1000))
+  if (resendIn.value === 0) {
+    resendTimer = null
+    return
+  }
   resendTimer = window.setInterval(() => {
     resendIn.value = Math.max(0, resendIn.value - 1)
     if (resendIn.value === 0 && resendTimer !== null) {
@@ -124,6 +141,10 @@ function switchEmailMode(mode: EmailMode) {
   if (emailBusy.value) {
     return
   }
+  if (emailRequest.value) {
+    errorMessage.value = translate('auth_registration_pending_action')
+    return
+  }
   emailMode.value = mode
   emailStep.value = 'form'
   emailCode.value = ''
@@ -138,6 +159,10 @@ function switchEmailMode(mode: EmailMode) {
 
 function backToEmailForm() {
   if (emailBusy.value) {
+    return
+  }
+  if (isRegister.value && emailRequest.value) {
+    errorMessage.value = translate('auth_registration_pending_action')
     return
   }
   emailStep.value = 'form'
@@ -179,13 +204,15 @@ async function sendEmailCode() {
         username: username.value.trim(),
         avatar: avatar.value.trim(),
         password: password.value,
+        passkeyPreference: passkeyPreference.value,
       })
     } else {
       emailLoginRequest.value = await requestEmailLogin(value)
     }
     emailStep.value = 'code'
+    hasSavedRegistration.value = false
     emailCode.value = ''
-    startResendTimer()
+    startResendTimer(emailRequest.value?.expiresAt || emailLoginRequest.value?.expiresAt)
     infoMessage.value = translate('auth_code_sent')
   } catch (error) {
     if (!isRegister.value && isEmailNotFound(error)) {
@@ -196,6 +223,101 @@ async function sendEmailCode() {
       syncAvatar()
       return
     }
+    const message = errorText(error)
+    errorMessage.value = message.toUpperCase().includes('DRAFT_STORAGE_UNAVAILABLE')
+      ? translate('auth_registration_storage_unavailable')
+      : message
+  } finally {
+    emailBusy.value = false
+  }
+}
+
+async function restoreEmailRegistration() {
+  if (recoveryPassword.value.length < 8) {
+    errorMessage.value = translate('auth_password_short')
+    return
+  }
+  recoveryBusy.value = true
+  clearMessages()
+  try {
+    emailRequest.value = await resumeEmailRegistration(recoveryPassword.value)
+    email.value = emailRequest.value.email
+    username.value = emailRequest.value.username
+    avatar.value = emailRequest.value.avatarUri
+    passkeyPreference.value = emailRequest.value.passkeyPreference || 'auto'
+    password.value = recoveryPassword.value
+    confirmPassword.value = recoveryPassword.value
+    recoveryPassword.value = ''
+    emailMode.value = 'register'
+    emailStep.value = 'code'
+    authMethod.value = 'email'
+    showRegistrationRecovery.value = false
+    hasSavedRegistration.value = false
+    startResendTimer(emailRequest.value.expiresAt)
+    infoMessage.value = translate('auth_registration_restored')
+  } catch (error) {
+    const message = errorText(error)
+    if (message.includes('DRAFT_EXPIRED')) {
+      hasSavedRegistration.value = false
+      showRegistrationRecovery.value = false
+    }
+    errorMessage.value = message.includes('DRAFT_DECRYPT_FAILED')
+      ? translate('auth_registration_restore_password_invalid')
+      : message.includes('DRAFT_EXPIRED')
+        ? translate('auth_registration_draft_expired')
+        : message.includes('DRAFT_STORAGE_UNAVAILABLE')
+          ? translate('auth_registration_storage_unavailable')
+        : translate('auth_registration_restore_failed')
+  } finally {
+    recoveryBusy.value = false
+  }
+}
+
+async function resendEmailCode() {
+  if (isRegister.value && emailRequest.value) {
+    emailBusy.value = true
+    clearMessages()
+    try {
+      emailRequest.value = await resendEmailRegistration(emailRequest.value)
+      startResendTimer(emailRequest.value.expiresAt)
+      infoMessage.value = translate('auth_registration_code_resent')
+    } catch (error) {
+      const message = errorText(error).toUpperCase()
+      errorMessage.value = message.includes('RATE_LIMITED')
+        ? translate('auth_registration_resend_wait')
+        : message.includes('RESEND_LIMIT')
+          ? translate('auth_registration_resend_limit')
+          : message.includes('EXPIRED')
+            ? translate('auth_registration_draft_expired')
+            : errorText(error)
+    } finally {
+      emailBusy.value = false
+    }
+    return
+  }
+  await sendEmailCode()
+}
+
+async function restartEmailRegistration() {
+  if (emailBusy.value) return
+  emailBusy.value = true
+  clearMessages()
+  try {
+    await ElMessageBox.confirm(String(translate('auth_registration_restart_confirm')), String(translate('auth_registration_restart')), { type: 'warning' })
+    await cancelEmailRegistration(emailRequest.value?.verificationId)
+    emailRequest.value = null
+    emailStep.value = 'form'
+    emailCode.value = ''
+    password.value = ''
+    confirmPassword.value = ''
+    emailMode.value = 'register'
+    authMethod.value = 'email'
+    stopResendTimer()
+    showRegistrationRecovery.value = false
+    hasSavedRegistration.value = false
+    infoMessage.value = translate('auth_registration_restarted')
+  } catch (error) {
+    if (error === 'cancel' || error === 'close') return
     errorMessage.value = errorText(error)
   } finally {
     emailBusy.value = false
@@ -213,12 +335,20 @@ async function confirmEmailCode() {
   emailBusy.value = true
   try {
     const loggedIn = isRegister.value
-      ? Boolean(emailRequest.value && await confirmEmailRegistration(emailRequest.value, code))
+      ? Boolean(emailRequest.value && await confirmEmailRegistration(
+        emailRequest.value,
+        code,
+        passkeyPreference.value === 'auto' ? undefined : passkeyPreference.value,
+      ))
       : Boolean(emailLoginRequest.value && await confirmEmailLogin(emailLoginRequest.value.verificationId, code))
     if (!loggedIn) {
       throw new Error(translate('auth_generic_error'))
     }
     stopResendTimer()
+    if (isRegister.value) {
+      hasSavedRegistration.value = false
+      emailRequest.value = null
+    }
     notifySuccess(translate(isRegister.value ? 'auth_register_success' : 'auth_login_success'))
     await router.replace({ path: '/market' })
   } catch (error) {
@@ -243,6 +373,14 @@ async function connectToWallet() {
 
 onBeforeUnmount(() => {
   stopResendTimer()
+})
+
+onMounted(async () => {
+  try {
+    hasSavedRegistration.value = await hasPendingEmailRegistration()
+  } catch {
+    hasSavedRegistration.value = false
+  }
 })
 </script>
 
@@ -319,7 +457,41 @@ onBeforeUnmount(() => {
           class="email-workspace"
           @submit.prevent="emailStep === 'code' ? confirmEmailCode() : sendEmailCode()"
         >
-          <div v-if="emailStep === 'form'" class="email-mode-switch" role="tablist" :aria-label="$t('auth_email_mode_label')">
+          <div v-if="emailStep === 'form' && hasSavedRegistration" class="registration-recovery">
+            <template v-if="!showRegistrationRecovery">
+              <p>{{ $t('auth_registration_pending') }}</p>
+              <button type="button" class="back-action" @click="showRegistrationRecovery = true">
+                <el-icon><ArrowRight /></el-icon>
+                <span>{{ $t('auth_registration_resume') }}</span>
+              </button>
+              <button type="button" class="resend-action" :disabled="emailBusy" @click="restartEmailRegistration">
+                {{ $t('auth_registration_restart') }}
+              </button>
+            </template>
+            <template v-else>
+              <label class="field-label" for="auth-recovery-password">{{ $t('auth_registration_resume_password') }}</label>
+              <el-input
+                id="auth-recovery-password"
+                v-model="recoveryPassword"
+                type="password"
+                show-password
+                autocomplete="current-password"
+                :placeholder="$t('auth_password_placeholder')"
+                @keyup.enter="restoreEmailRegistration"
+              />
+              <button type="button" class="primary-action" :disabled="recoveryBusy" @click="restoreEmailRegistration">
+                <span>{{ recoveryBusy ? $t('auth_processing') : $t('auth_registration_resume') }}</span>
+                <el-icon v-if="!recoveryBusy"><ArrowRight /></el-icon>
+              </button>
+              <button type="button" class="resend-action" @click="showRegistrationRecovery = false">{{ $t('auth_change_email') }}</button>
+              <button type="button" class="resend-action" :disabled="emailBusy" @click="restartEmailRegistration">
+                {{ $t('auth_registration_restart') }}
+              </button>
+              <div v-if="errorMessage" class="auth-alert error" role="alert">{{ errorMessage }}</div>
+            </template>
+          </div>
+
+          <div v-if="emailStep === 'form' && !hasSavedRegistration" class="email-mode-switch" role="tablist" :aria-label="$t('auth_email_mode_label')">
             <button
               type="button"
               role="tab"
@@ -340,7 +512,7 @@ onBeforeUnmount(() => {
             </button>
           </div>
 
-          <template v-if="emailStep === 'form'">
+          <template v-if="emailStep === 'form' && !hasSavedRegistration">
             <div v-if="emailMode === 'register'" class="registration-fields">
               <label class="field-label" for="auth-username">{{ $t('auth_username_label') }}</label>
               <el-input
@@ -393,6 +565,42 @@ onBeforeUnmount(() => {
                 :placeholder="$t('auth_confirm_password_placeholder')"
                 @keyup.enter="sendEmailCode"
               />
+
+              <fieldset class="passkey-choice">
+                <legend class="field-label">{{ $t('auth_passkey_choice_label') }}</legend>
+                <p class="field-hint passkey-choice-hint">{{ $t('auth_passkey_choice_hint') }}</p>
+                <div class="passkey-choice-grid">
+                  <label class="passkey-choice-option" :class="{ selected: passkeyPreference === 'auto' }">
+                    <input v-model="passkeyPreference" type="radio" value="auto" />
+                    <span class="passkey-choice-copy">
+                      <strong>{{ $t('auth_passkey_auto') }}</strong>
+                      <small>{{ $t('auth_passkey_auto_desc') }}</small>
+                    </span>
+                  </label>
+                  <label class="passkey-choice-option" :class="{ selected: passkeyPreference === 'client-device' }">
+                    <input v-model="passkeyPreference" type="radio" value="client-device" />
+                    <span class="passkey-choice-copy">
+                      <strong>{{ $t('auth_passkey_device') }}</strong>
+                      <small>{{ $t('auth_passkey_device_desc') }}</small>
+                    </span>
+                  </label>
+                  <label class="passkey-choice-option" :class="{ selected: passkeyPreference === 'hybrid' }">
+                    <input v-model="passkeyPreference" type="radio" value="hybrid" />
+                    <span class="passkey-choice-copy">
+                      <strong>{{ $t('auth_passkey_cross_device') }}</strong>
+                      <small>{{ $t('auth_passkey_cross_device_desc') }}</small>
+                    </span>
+                  </label>
+                  <label class="passkey-choice-option" :class="{ selected: passkeyPreference === 'security-key' }">
+                    <input v-model="passkeyPreference" type="radio" value="security-key" />
+                    <span class="passkey-choice-copy">
+                      <strong>{{ $t('auth_passkey_security_key') }}</strong>
+                      <small>{{ $t('auth_passkey_security_key_desc') }}</small>
+                    </span>
+                  </label>
+                </div>
+                <p class="field-hint passkey-provider-note">{{ $t('auth_passkey_provider_note') }}</p>
+              </fieldset>
             </div>
 
             <label class="field-label" for="auth-email">{{ $t('auth_email_label') }}</label>
@@ -415,28 +623,33 @@ onBeforeUnmount(() => {
           </template>
 
           <template v-else>
-            <button type="button" class="back-action" :disabled="emailBusy" @click="backToEmailForm">
-              <el-icon><ArrowLeft /></el-icon>
-              <span>{{ $t('auth_change_email') }}</span>
-            </button>
-            <label class="field-label" for="auth-code">{{ $t('auth_code_label') }}</label>
-            <el-input
-              id="auth-code"
-              v-model="emailCode"
-              class="code-input"
-              inputmode="numeric"
-              maxlength="6"
-              autocomplete="one-time-code"
-              :placeholder="$t('auth_code_placeholder')"
-              @keyup.enter="confirmEmailCode"
-            />
-            <button type="button" class="primary-action" :disabled="emailBusy" @click="confirmEmailCode">
-              <span>{{ emailBusy ? $t('auth_processing') : verifyActionLabel }}</span>
-              <el-icon v-if="!emailBusy"><ArrowRight /></el-icon>
-            </button>
-            <button type="button" class="resend-action" :disabled="emailBusy || resendIn > 0" @click="sendEmailCode">
-              {{ resendIn > 0 ? $t('auth_resend_in', { seconds: resendIn }) : $t('auth_resend_code') }}
-            </button>
+            <template v-if="emailStep === 'code'">
+              <button v-if="!isRegister" type="button" class="back-action" :disabled="emailBusy" @click="backToEmailForm">
+                <el-icon><ArrowLeft /></el-icon>
+                <span>{{ $t('auth_change_email') }}</span>
+              </button>
+              <label class="field-label" for="auth-code">{{ $t('auth_code_label') }}</label>
+              <el-input
+                id="auth-code"
+                v-model="emailCode"
+                class="code-input"
+                inputmode="numeric"
+                maxlength="6"
+                autocomplete="one-time-code"
+                :placeholder="$t('auth_code_placeholder')"
+                @keyup.enter="confirmEmailCode"
+              />
+              <button type="button" class="primary-action" :disabled="emailBusy" @click="confirmEmailCode">
+                <span>{{ emailBusy ? $t('auth_processing') : verifyActionLabel }}</span>
+                <el-icon v-if="!emailBusy"><ArrowRight /></el-icon>
+              </button>
+              <button type="button" class="resend-action" :disabled="emailBusy || resendIn > 0" @click="resendEmailCode">
+                {{ resendIn > 0 ? $t('auth_resend_in', { seconds: resendIn }) : $t('auth_resend_code') }}
+              </button>
+              <button v-if="isRegister" type="button" class="resend-action" :disabled="emailBusy" @click="restartEmailRegistration">
+                {{ $t('auth_registration_restart') }}
+              </button>
+            </template>
           </template>
 
           <div v-if="infoMessage" class="auth-alert info" role="status">{{ infoMessage }}</div>
@@ -742,6 +955,17 @@ onBeforeUnmount(() => {
   grid-template-columns: 1fr;
 }
 
+.registration-recovery {
+  margin-bottom: 22px;
+}
+
+.registration-recovery > p {
+  margin: 0 0 18px;
+  color: #46596d;
+  font-size: 14px;
+  line-height: 1.6;
+}
+
 .field-label {
   display: block;
   margin: 0 0 7px;
@@ -823,6 +1047,78 @@ onBeforeUnmount(() => {
   color: #8a96a0;
   font-size: 12px;
   line-height: 1.55;
+}
+
+.passkey-choice {
+  min-width: 0;
+  padding: 17px 0 0;
+  margin: 17px 0 0;
+  border: 0;
+  border-top: 1px solid #e7ecea;
+}
+
+.passkey-choice .field-label {
+  margin: 0;
+  color: #46596d;
+}
+
+.passkey-choice-hint {
+  margin-top: 5px;
+}
+
+.passkey-choice-grid {
+  display: grid;
+  gap: 7px;
+  margin-top: 11px;
+}
+
+.passkey-choice-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 11px;
+  border: 1px solid #dfe7e4;
+  border-radius: 3px;
+  background: #fbfcfb;
+  cursor: pointer;
+  transition: border-color 0.18s ease, background-color 0.18s ease;
+}
+
+.passkey-choice-option:hover,
+.passkey-choice-option.selected {
+  border-color: #7cc5b2;
+  background: #f2faf7;
+}
+
+.passkey-choice-option input {
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  margin: 2px 0 0;
+  accent-color: #0b8e8b;
+}
+
+.passkey-choice-copy {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.passkey-choice-copy strong {
+  color: #142640;
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.35;
+}
+
+.passkey-choice-copy small {
+  color: #7b8993;
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.passkey-provider-note {
+  margin-top: 9px;
 }
 
 .primary-action {
@@ -1117,7 +1413,8 @@ onBeforeUnmount(() => {
 @media (prefers-reduced-motion: reduce) {
   .method-tab,
   .auth-panel :deep(.el-input__wrapper),
-  .primary-action {
+  .primary-action,
+  .passkey-choice-option {
     transition: none;
   }
 }
