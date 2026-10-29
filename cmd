@@ -28,9 +28,16 @@ Commands:
   ./cmd health [health-check options]
   ./cmd secrets init|set|remove|passwd|unlock|verify [args]
   ./cmd admin allow add|remove|list [did-or-wallet]
+  ./cmd audit show
+  ./cmd audit set --approvers <wallet[,wallet...]> --required-approvals <count>
+  ./cmd audit approver add|remove <wallet>
+  ./cmd audit threshold set <count>
+  ./cmd identity email reset <email> [--execute --confirm-email <email>]
 
 Examples:
   ./cmd admin allow add 0x1111111111111111111111111111111111111111
+  ./cmd audit set --approvers 0x1111111111111111111111111111111111111111 --required-approvals 1
+  ./cmd identity email reset user@example.com
   ./cmd secrets set MAIL_SMTP_PASSWORD
   ./cmd service restart
   ./cmd health --level readiness --retries 3
@@ -127,6 +134,29 @@ run_admin() {
   esac
 }
 
+run_audit() {
+  require_file "$ROOT_DIR/scripts/audit-config.cjs"
+  node "$ROOT_DIR/scripts/audit-config.cjs" "$@" --config "${APP_CONFIG_PATH:-$ROOT_DIR/config.js}"
+}
+
+run_identity() {
+  local resource="${1:-}"
+  local action="${2:-}"
+  shift 2 || true
+  case "$resource:$action" in
+    email:reset)
+      require_file "$ROOT_DIR/scripts/reset-identity-email.cjs"
+      node "$ROOT_DIR/scripts/reset-identity-email.cjs" "$@" \
+        --root "$ROOT_DIR" \
+        --config "${APP_CONFIG_PATH:-$ROOT_DIR/config.js}" \
+        --pid-file "${PID_FILE:-${RUN_DIR:-$ROOT_DIR/run}/node.pid}"
+      ;;
+    *)
+      fail "usage: ./cmd identity email reset <email> [--execute --confirm-email <email>]"
+      ;;
+  esac
+}
+
 main() {
   local command="${1:-}"
   if [[ -z "$command" || "$command" == "help" || "$command" == "--help" || "$command" == "-h" ]]; then
@@ -151,6 +181,12 @@ main() {
       ;;
     admin)
       run_admin "$@"
+      ;;
+    audit)
+      run_audit "$@"
+      ;;
+    identity)
+      run_identity "$@"
       ;;
     *)
       usage
